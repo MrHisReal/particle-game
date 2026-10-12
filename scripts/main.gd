@@ -11,6 +11,9 @@ extends Node2D
 @onready var toggle_grid_btn: Button = %ToggleGridBtn
 @onready var color_mode_btn: Button = %ColorModeBtn
 @onready var clear_btn: Button = %ClearBtn
+@onready var pause_btn: Button = %PauseBtn
+@onready var rules_btn: Button = %RulesBtn
+@onready var default_rules_btn: Button = %DefaultRulesBtn
 
 
 func _ready() -> void:
@@ -26,6 +29,9 @@ func _ready() -> void:
 	toggle_grid_btn.pressed.connect(_on_toggle_grid_pressed)
 	color_mode_btn.pressed.connect(_on_color_mode_pressed)
 	clear_btn.pressed.connect(_on_clear_pressed)
+	pause_btn.pressed.connect(_on_pause_pressed)
+	rules_btn.pressed.connect(simulation_plane.randomize_rules)
+	default_rules_btn.pressed.connect(simulation_plane.set_default_rules)
 	count_slider.value_changed.connect(_on_count_slider_changed)
 
 	_update_info_label(simulation_plane.particles.size())
@@ -58,6 +64,11 @@ func _on_color_mode_pressed() -> void:
 
 func _on_clear_pressed() -> void:
 	simulation_plane.clear_particles()
+
+
+func _on_pause_pressed() -> void:
+	simulation_plane.simulation_running = not simulation_plane.simulation_running
+	pause_btn.text = "Pause" if simulation_plane.simulation_running else "Play"
 
 
 func _on_count_slider_changed(value: float) -> void:

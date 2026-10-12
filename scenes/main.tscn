@@ -94,3 +94,18 @@ text = "Colors: Multi"
 unique_name_in_owner = true
 layout_mode = 2
 text = "Clear"
+
+[node name="PauseBtn" type="Button" parent="HUD/TopBar/Margin/HBox"]
+unique_name_in_owner = true
+layout_mode = 2
+text = "Pause"
+
+[node name="RulesBtn" type="Button" parent="HUD/TopBar/Margin/HBox"]
+unique_name_in_owner = true
+layout_mode = 2
+text = "Random Rules"
+
+[node name="DefaultRulesBtn" type="Button" parent="HUD/TopBar/Margin/HBox"]
+unique_name_in_owner = true
+layout_mode = 2
+text = "Default Rules"
