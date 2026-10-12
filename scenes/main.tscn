@@ -1,0 +1,96 @@
+[gd_scene load_steps=3 format=3]
+
+[ext_resource type="Script" path="res://scripts/main.gd" id="1_main"]
+[ext_resource type="Script" path="res://scripts/simulation_plane.gd" id="2_plane"]
+
+[node name="Main" type="Node2D"]
+script = ExtResource("1_main")
+
+[node name="BackgroundLayer" type="CanvasLayer" parent="."]
+layer = -1
+
+[node name="BackgroundColor" type="ColorRect" parent="BackgroundLayer"]
+anchors_preset = 15
+anchor_right = 1.0
+anchor_bottom = 1.0
+grow_horizontal = 2
+grow_vertical = 2
+color = Color(0.04, 0.05, 0.07, 1)
+
+[node name="SimulationPlane" type="Node2D" parent="."]
+script = ExtResource("2_plane")
+
+[node name="HUD" type="CanvasLayer" parent="."]
+
+[node name="TopBar" type="PanelContainer" parent="HUD"]
+anchors_preset = 10
+anchor_right = 1.0
+offset_bottom = 50.0
+grow_horizontal = 2
+
+[node name="Margin" type="MarginContainer" parent="HUD/TopBar"]
+layout_mode = 2
+theme_override_constants/margin_left = 16
+theme_override_constants/margin_top = 8
+theme_override_constants/margin_right = 16
+theme_override_constants/margin_bottom = 8
+
+[node name="HBox" type="HBoxContainer" parent="HUD/TopBar/Margin"]
+layout_mode = 2
+theme_override_constants/separation = 14
+
+[node name="Title" type="Label" parent="HUD/TopBar/Margin/HBox"]
+layout_mode = 2
+text = "2D Particle Simulation"
+
+[node name="Separator1" type="VSeparator" parent="HUD/TopBar/Margin/HBox"]
+layout_mode = 2
+
+[node name="InfoLabel" type="Label" parent="HUD/TopBar/Margin/HBox"]
+unique_name_in_owner = true
+layout_mode = 2
+text = "Particles: 300  |  Plane: 960 × 540"
+
+[node name="Spacer" type="Control" parent="HUD/TopBar/Margin/HBox"]
+layout_mode = 2
+size_flags_horizontal = 3
+
+[node name="CountLabel" type="Label" parent="HUD/TopBar/Margin/HBox"]
+layout_mode = 2
+text = "Count:"
+
+[node name="CountSlider" type="HSlider" parent="HUD/TopBar/Margin/HBox"]
+unique_name_in_owner = true
+custom_minimum_size = Vector2(130, 0)
+layout_mode = 2
+size_flags_vertical = 4
+min_value = 10.0
+max_value = 1500.0
+step = 10.0
+value = 300.0
+
+[node name="CountDisplay" type="Label" parent="HUD/TopBar/Margin/HBox"]
+unique_name_in_owner = true
+custom_minimum_size = Vector2(36, 0)
+layout_mode = 2
+text = "300"
+
+[node name="RepopulateBtn" type="Button" parent="HUD/TopBar/Margin/HBox"]
+unique_name_in_owner = true
+layout_mode = 2
+text = "Randomize"
+
+[node name="ToggleGridBtn" type="Button" parent="HUD/TopBar/Margin/HBox"]
+unique_name_in_owner = true
+layout_mode = 2
+text = "Grid"
+
+[node name="ColorModeBtn" type="Button" parent="HUD/TopBar/Margin/HBox"]
+unique_name_in_owner = true
+layout_mode = 2
+text = "Colors: Multi"
+
+[node name="ClearBtn" type="Button" parent="HUD/TopBar/Margin/HBox"]
+unique_name_in_owner = true
+layout_mode = 2
+text = "Clear"
