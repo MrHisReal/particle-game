@@ -2,8 +2,16 @@ class_name SimulationPlane
 extends Node2D
 
 ## Represents the 2D simulation plane and manages the particles residing on it.
+## Particle physics runs on the GPU (see ParticleCompute); this node owns the settings,
+## the color rules, and the MultiMesh the particles are drawn with.
 
 signal particles_updated(count: int)
+
+const PARTICLE_SHADER: Shader = preload("res://shaders/particle_draw.gdshader")
+## Width of the soft glow drawn around each particle's solid core.
+const GLOW_WIDTH := 1.5
+## Longest time step simulated in one frame, so a frame hitch can't launch particles.
+const MAX_STEP := 1.0 / 30.0
 
 @export_group("Plane Geometry")
 ## The width and height of the 2D simulation plane.
@@ -38,7 +46,7 @@ signal particles_updated(count: int)
 ## Initial number of particles to scatter across the plane.
 @export var initial_particle_count: int = 300
 
-## Default radius for spawned particles.
+## Radius of every particle.
 @export var particle_radius: float = 4.5
 
 ## When true, each particle is assigned a random species (color) from species_colors.
@@ -48,7 +56,7 @@ signal particles_updated(count: int)
 @export var default_particle_color: Color = Color(0.35, 0.82, 1.0, 0.95)
 
 @export_group("Species")
-## Display color for each species. A particle's species decides how it reacts to others.
+## Display color for each species (up to 16). A particle's species decides how it reacts to others.
 @export var species_colors: Array[Color] = [
 	Color(1.0, 0.32, 0.32, 0.95),
 	Color(0.35, 0.95, 0.45, 0.95),
@@ -63,7 +71,8 @@ signal particles_updated(count: int)
 ## Whether the force simulation is advancing.
 @export var simulation_running: bool = true
 
-## Maximum distance at which particles influence each other.
+## Maximum distance at which particles influence each other. Smaller values are much
+## faster at high particle counts, since each particle checks fewer neighbors.
 @export var interaction_radius: float = 80.0
 
 ## Fraction of interaction_radius inside which particles always push apart, regardless of color.
@@ -78,28 +87,46 @@ signal particles_updated(count: int)
 ## Upper bound on particle speed (pixels / second).
 @export var max_speed: float = 300.0
 
-## Array storing all currently active particles on the plane.
-var particles: Array[Particle] = []
+@export_group("Collisions")
+## Treat particles as solid discs that push each other apart instead of overlapping.
+@export var particle_collisions: bool = true
+
+## Collision passes per frame. More passes keep dense clumps from overlapping, at a GPU cost.
+@export_range(1, 16) var collision_iterations: int = 4
+
+## Number of particles currently on the plane.
+var particle_count: int:
+	get:
+		return _species.size()
 
 ## attraction_rules[a][b] is how species a reacts to species b:
 ## positive values attract, negative values repel, in the range [-1, 1].
 var attraction_rules: Array[PackedFloat32Array] = []
 
+var _gpu := ParticleCompute.new()
+var _gpu_ready: bool = false
+## Species index of each particle, kept on the CPU so particles can be re-uploaded.
+var _species := PackedInt32Array()
+var _multimesh := MultiMesh.new()
+
 
 func _ready() -> void:
-	# Center the plane in the viewport and populate particles
 	center_in_viewport()
 	get_viewport().size_changed.connect(_on_viewport_size_changed)
+	_setup_particle_renderer()
+	_gpu_ready = _gpu.setup()
 	set_default_rules()
 	populate_particles(initial_particle_count)
 
 
-func _physics_process(delta: float) -> void:
-	if not simulation_running or particles.is_empty():
-		return
-	_apply_forces(delta)
-	_integrate(delta)
-	queue_redraw()
+func _process(delta: float) -> void:
+	if simulation_running and _gpu_ready and not _species.is_empty():
+		_step(minf(delta, MAX_STEP))
+
+
+func _notification(what: int) -> void:
+	if what == NOTIFICATION_PREDELETE:
+		_gpu.free_resources()
 
 
 func _on_viewport_size_changed() -> void:
@@ -122,51 +149,44 @@ func populate_particles(count: int = -1) -> void:
 	else:
 		count = initial_particle_count
 
-	particles.clear()
-
 	var margin: float = particle_radius + border_width + 1.0
-	var min_x: float = margin
 	var max_x: float = maxf(margin, plane_size.x - margin)
-	var min_y: float = margin
 	var max_y: float = maxf(margin, plane_size.y - margin)
 
+	var states := PackedFloat32Array()
+	states.resize(count * 4)
+	states.fill(0.0)
+	var species := PackedInt32Array()
+	species.resize(count)
 	for i in range(count):
-		var rand_x: float = randf_range(min_x, max_x)
-		var rand_y: float = randf_range(min_y, max_y)
-		var pos := Vector2(rand_x, rand_y)
+		states[i * 4] = randf_range(margin, max_x)
+		states[i * 4 + 1] = randf_range(margin, max_y)
+		species[i] = _pick_species()
 
-		var species: int = _pick_species()
-		var p := Particle.new(pos, _species_color(species), particle_radius, species)
-		particles.append(p)
-
-	particles_updated.emit(particles.size())
-	queue_redraw()
+	_upload(states, species)
 
 
 ## Adds an individual particle at the given plane-local coordinate.
 ## A negative species_override picks a random species.
-func add_particle(local_pos: Vector2, species_override: int = -1, radius_override: float = -1.0) -> void:
-	var r: float = particle_radius if radius_override <= 0.0 else radius_override
-	var species: int = _pick_species() if species_override < 0 else species_override
-
-	# Clamp to plane bounds
-	var margin: float = r + border_width
+func add_particle(local_pos: Vector2, species_override: int = -1) -> void:
+	if not _gpu_ready:
+		return
+	var margin: float = particle_radius + border_width
 	var clamped_pos := Vector2(
 		clampf(local_pos.x, margin, maxf(margin, plane_size.x - margin)),
 		clampf(local_pos.y, margin, maxf(margin, plane_size.y - margin))
 	)
 
-	var p := Particle.new(clamped_pos, _species_color(species), r, species)
-	particles.append(p)
-	particles_updated.emit(particles.size())
-	queue_redraw()
+	var states: PackedFloat32Array = _gpu.read_states()
+	states.append_array([clamped_pos.x, clamped_pos.y, 0.0, 0.0])
+	var species: PackedInt32Array = _species.duplicate()
+	species.append(_pick_species() if species_override < 0 else species_override)
+	_upload(states, species)
 
 
 ## Clears all particles currently on the plane.
 func clear_particles() -> void:
-	particles.clear()
-	particles_updated.emit(0)
-	queue_redraw()
+	_upload(PackedFloat32Array(), PackedInt32Array())
 
 
 ## Returns true if the given plane-local position lies inside the plane boundaries.
@@ -178,7 +198,7 @@ func is_point_inside(local_pos: Vector2) -> bool:
 ## Default rules: each color is drawn to one partner color, pushed away by the others,
 ## and mildly attracted to its own kind. The chase cycle is Red -> Blue -> Green -> Yellow -> Red.
 func set_default_rules() -> void:
-	if species_colors.size() != 4:
+	if _species_total() != 4:
 		randomize_rules()
 		return
 	attraction_rules = [
@@ -188,12 +208,12 @@ func set_default_rules() -> void:
 		PackedFloat32Array([-0.5,  0.8,   0.3, -0.4]), # Blue
 		PackedFloat32Array([ 0.8, -0.4,  -0.5,  0.3]), # Yellow
 	]
-	print_rules()
+	_sync_rules()
 
 
 ## Replaces the rule table with random attraction/repulsion values in [-1, 1].
 func randomize_rules() -> void:
-	var n: int = species_colors.size()
+	var n: int = _species_total()
 	attraction_rules.clear()
 	for a in range(n):
 		var row := PackedFloat32Array()
@@ -201,7 +221,7 @@ func randomize_rules() -> void:
 		for b in range(n):
 			row[b] = snappedf(randf_range(-1.0, 1.0), 0.1)
 		attraction_rules.append(row)
-	print_rules()
+	_sync_rules()
 
 
 ## Prints the current rule table to the output console.
@@ -214,110 +234,81 @@ func print_rules() -> void:
 		print("  %s -> %s" % [_species_name(a), ", ".join(parts)])
 
 
-## Signed force for a pair at normalized distance r (0..1 of interaction_radius).
-## Close range always repels so particles don't collapse; beyond that, the
-## attraction value peaks halfway through the remaining range and fades to zero.
-func _force_profile(r: float, attraction: float) -> float:
-	if r < repulsion_zone:
-		return r / repulsion_zone - 1.0
-	if r < 1.0:
-		return attraction * (1.0 - absf(2.0 * r - 1.0 - repulsion_zone) / (1.0 - repulsion_zone))
-	return 0.0
+func _setup_particle_renderer() -> void:
+	var outer_radius: float = particle_radius + GLOW_WIDTH
+	var mesh := QuadMesh.new()
+	mesh.size = Vector2.ONE * outer_radius * 2.0
+
+	var material := ShaderMaterial.new()
+	material.shader = PARTICLE_SHADER
+	material.set_shader_parameter("core_ratio", particle_radius / outer_radius)
+
+	_multimesh.transform_format = MultiMesh.TRANSFORM_2D
+	_multimesh.use_colors = true
+	_multimesh.mesh = mesh
+
+	var instance := MultiMeshInstance2D.new()
+	instance.multimesh = _multimesh
+	instance.material = material
+	add_child(instance)
 
 
-## Accumulates color-based forces into each particle's velocity using a uniform grid
-## so each particle only checks neighbors in the surrounding cells.
-func _apply_forces(delta: float) -> void:
-	var count: int = particles.size()
-	var cell_size: float = maxf(interaction_radius, 1.0)
-	var cols: int = maxi(1, ceili(plane_size.x / cell_size))
-	var rows: int = maxi(1, ceili(plane_size.y / cell_size))
-	var cell_total: int = cols * rows
+## Replaces every particle on the GPU and resizes the MultiMesh to match.
+func _upload(states: PackedFloat32Array, species: PackedInt32Array) -> void:
+	_species = species
+	# Instance data is written on the GPU, so the bounds can't be computed from it.
+	_multimesh.custom_aabb = AABB(Vector3(-particle_radius, -particle_radius, -1.0),
+		Vector3(plane_size.x + particle_radius * 2.0, plane_size.y + particle_radius * 2.0, 2.0))
+	_multimesh.instance_count = species.size()
 
-	# Bucket particle indices by cell (counting sort into a flat array).
-	var cell_of := PackedInt32Array()
-	cell_of.resize(count)
-	var cell_start := PackedInt32Array()
-	cell_start.resize(cell_total + 1)
-	cell_start.fill(0)
-	for i in range(count):
-		var pos: Vector2 = particles[i].position
-		var cx: int = clampi(int(pos.x / cell_size), 0, cols - 1)
-		var cy: int = clampi(int(pos.y / cell_size), 0, rows - 1)
-		var c: int = cx + cy * cols
-		cell_of[i] = c
-		cell_start[c + 1] += 1
-	for c in range(cell_total):
-		cell_start[c + 1] += cell_start[c]
-	var fill_pos: PackedInt32Array = cell_start.duplicate()
-	var sorted := PackedInt32Array()
-	sorted.resize(count)
-	for i in range(count):
-		var c: int = cell_of[i]
-		sorted[fill_pos[c]] = i
-		fill_pos[c] += 1
+	if _gpu_ready:
+		var instance_buffer: RID = RenderingServer.multimesh_get_buffer_rd_rid(_multimesh.get_rid())
+		_gpu.upload(states, species, instance_buffer)
+		_sync_palette()
+		_step(0.0)
 
-	var r_max: float = interaction_radius
-	var r_max_sq: float = r_max * r_max
-	var species_count: int = attraction_rules.size()
-
-	for i in range(count):
-		var p: Particle = particles[i]
-		if p.species >= species_count:
-			continue
-		var rules: PackedFloat32Array = attraction_rules[p.species]
-		var cx: int = cell_of[i] % cols
-		@warning_ignore("integer_division")
-		var cy: int = cell_of[i] / cols
-		var acc := Vector2.ZERO
-
-		for ny in range(maxi(cy - 1, 0), mini(cy + 2, rows)):
-			for nx in range(maxi(cx - 1, 0), mini(cx + 2, cols)):
-				var c: int = nx + ny * cols
-				for k in range(cell_start[c], cell_start[c + 1]):
-					var j: int = sorted[k]
-					if j == i:
-						continue
-					var q: Particle = particles[j]
-					var offset: Vector2 = q.position - p.position
-					var dist_sq: float = offset.length_squared()
-					if dist_sq >= r_max_sq or dist_sq < 0.0001:
-						continue
-					var attraction: float = rules[q.species] if q.species < rules.size() else 0.0
-					var dist: float = sqrt(dist_sq)
-					acc += offset / dist * _force_profile(dist / r_max, attraction)
-
-		p.velocity += acc * force_strength * delta
+	particles_updated.emit(species.size())
 
 
-## Applies friction, moves particles, and bounces them off the plane's edges.
-func _integrate(delta: float) -> void:
-	var damping: float = exp(-friction * delta)
-	for p in particles:
-		p.velocity = (p.velocity * damping).limit_length(max_speed)
-		p.position += p.velocity * delta
+func _step(delta: float) -> void:
+	_gpu.plane_size = plane_size
+	_gpu.interaction_radius = interaction_radius
+	_gpu.repulsion_zone = repulsion_zone
+	_gpu.force_strength = force_strength
+	_gpu.friction = friction
+	_gpu.max_speed = max_speed
+	_gpu.edge_margin = particle_radius + border_width
+	_gpu.species_count = _species_total()
+	_gpu.contact_distance = particle_radius * 2.0 if particle_collisions else 0.0
+	_gpu.collision_iterations = collision_iterations
+	_gpu.step(delta)
 
-		var margin: float = p.radius + border_width
-		var max_x: float = maxf(margin, plane_size.x - margin)
-		var max_y: float = maxf(margin, plane_size.y - margin)
-		if p.position.x < margin:
-			p.position.x = margin
-			p.velocity.x = absf(p.velocity.x)
-		elif p.position.x > max_x:
-			p.position.x = max_x
-			p.velocity.x = -absf(p.velocity.x)
-		if p.position.y < margin:
-			p.position.y = margin
-			p.velocity.y = absf(p.velocity.y)
-		elif p.position.y > max_y:
-			p.position.y = max_y
-			p.velocity.y = -absf(p.velocity.y)
+
+func _sync_rules() -> void:
+	print_rules()
+	if not _gpu_ready:
+		return
+	var flat := PackedFloat32Array()
+	for row in attraction_rules:
+		flat.append_array(row)
+	_gpu.set_rules(flat)
+
+
+func _sync_palette() -> void:
+	var colors := PackedColorArray()
+	for species in range(_species_total()):
+		colors.append(_species_color(species))
+	_gpu.set_palette(colors)
+
+
+func _species_total() -> int:
+	return clampi(species_colors.size(), 1, ParticleCompute.MAX_SPECIES)
 
 
 func _pick_species() -> int:
-	if not random_colors or species_colors.is_empty():
+	if not random_colors:
 		return 0
-	return randi() % species_colors.size()
+	return randi() % _species_total()
 
 
 func _species_color(species: int) -> Color:
@@ -351,12 +342,5 @@ func _draw() -> void:
 			y += grid_step
 
 	# 3. Plane Border Outline
+	# Particles are drawn on top by the MultiMeshInstance2D child.
 	draw_rect(plane_rect, border_color, false, border_width)
-
-	# 4. Particles populated on the plane
-	for p in particles:
-		# Soft outer glow
-		var glow_col := Color(p.color.r, p.color.g, p.color.b, 0.25)
-		draw_circle(p.position, p.radius + 1.5, glow_col)
-		# Solid particle core
-		draw_circle(p.position, p.radius, p.color)

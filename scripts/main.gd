@@ -34,7 +34,11 @@ func _ready() -> void:
 	default_rules_btn.pressed.connect(simulation_plane.set_default_rules)
 	count_slider.value_changed.connect(_on_count_slider_changed)
 
-	_update_info_label(simulation_plane.particles.size())
+	_update_info_label(simulation_plane.particle_count)
+
+
+func _process(_delta: float) -> void:
+	_update_info_label(simulation_plane.particle_count)
 
 
 func _on_particles_updated(count: int) -> void:
@@ -44,7 +48,8 @@ func _on_particles_updated(count: int) -> void:
 func _update_info_label(count: int) -> void:
 	var pw: int = int(simulation_plane.plane_size.x)
 	var ph: int = int(simulation_plane.plane_size.y)
-	info_label.text = "Particles: %d  |  Plane: %d × %d" % [count, pw, ph]
+	var fps: int = int(Engine.get_frames_per_second())
+	info_label.text = "Particles: %d  |  Plane: %d × %d  |  FPS: %d" % [count, pw, ph, fps]
 
 
 func _on_repopulate_pressed() -> void:
