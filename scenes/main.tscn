@@ -22,91 +22,89 @@ script = ExtResource("2_plane")
 
 [node name="HUD" type="CanvasLayer" parent="."]
 
-[node name="TopBar" type="PanelContainer" parent="HUD"]
+[node name="UI" type="Control" parent="HUD"]
+layout_mode = 3
+anchors_preset = 15
+anchor_right = 1.0
+anchor_bottom = 1.0
+grow_horizontal = 2
+grow_vertical = 2
+mouse_filter = 2
+
+[node name="TopBar" type="PanelContainer" parent="HUD/UI"]
+unique_name_in_owner = true
+layout_mode = 1
 anchors_preset = 10
 anchor_right = 1.0
-offset_bottom = 50.0
+offset_bottom = 44.0
 grow_horizontal = 2
 
-[node name="Margin" type="MarginContainer" parent="HUD/TopBar"]
+[node name="Margin" type="MarginContainer" parent="HUD/UI/TopBar"]
 layout_mode = 2
 theme_override_constants/margin_left = 16
-theme_override_constants/margin_top = 8
+theme_override_constants/margin_top = 6
 theme_override_constants/margin_right = 16
-theme_override_constants/margin_bottom = 8
+theme_override_constants/margin_bottom = 6
 
-[node name="HBox" type="HBoxContainer" parent="HUD/TopBar/Margin"]
+[node name="HBox" type="HBoxContainer" parent="HUD/UI/TopBar/Margin"]
 layout_mode = 2
 theme_override_constants/separation = 14
 
-[node name="Title" type="Label" parent="HUD/TopBar/Margin/HBox"]
+[node name="Title" type="Label" parent="HUD/UI/TopBar/Margin/HBox"]
 layout_mode = 2
-text = "2D Particle Simulation"
+theme_override_font_sizes/font_size = 17
+text = "Particle Simulation"
 
-[node name="Separator1" type="VSeparator" parent="HUD/TopBar/Margin/HBox"]
+[node name="Separator" type="VSeparator" parent="HUD/UI/TopBar/Margin/HBox"]
 layout_mode = 2
 
-[node name="InfoLabel" type="Label" parent="HUD/TopBar/Margin/HBox"]
+[node name="StatsLabel" type="Label" parent="HUD/UI/TopBar/Margin/HBox"]
 unique_name_in_owner = true
-layout_mode = 2
-text = "Particles: 300  |  Plane: 960 × 540"
-
-[node name="Spacer" type="Control" parent="HUD/TopBar/Margin/HBox"]
 layout_mode = 2
 size_flags_horizontal = 3
+clip_text = true
 
-[node name="CountLabel" type="Label" parent="HUD/TopBar/Margin/HBox"]
-layout_mode = 2
-text = "Count:"
-
-[node name="CountSlider" type="HSlider" parent="HUD/TopBar/Margin/HBox"]
+[node name="StepBtn" type="Button" parent="HUD/UI/TopBar/Margin/HBox"]
 unique_name_in_owner = true
-custom_minimum_size = Vector2(130, 0)
+custom_minimum_size = Vector2(70, 0)
 layout_mode = 2
-size_flags_vertical = 4
-min_value = 10.0
-max_value = 100000.0
-step = 10.0
-value = 300.0
-exp_edit = true
+focus_mode = 0
+tooltip_text = "Advance one frame while paused (.)"
+text = "Step"
 
-[node name="CountDisplay" type="Label" parent="HUD/TopBar/Margin/HBox"]
+[node name="PauseBtn" type="Button" parent="HUD/UI/TopBar/Margin/HBox"]
 unique_name_in_owner = true
-custom_minimum_size = Vector2(52, 0)
+custom_minimum_size = Vector2(90, 0)
 layout_mode = 2
-text = "300"
-
-[node name="RepopulateBtn" type="Button" parent="HUD/TopBar/Margin/HBox"]
-unique_name_in_owner = true
-layout_mode = 2
-text = "Randomize"
-
-[node name="ToggleGridBtn" type="Button" parent="HUD/TopBar/Margin/HBox"]
-unique_name_in_owner = true
-layout_mode = 2
-text = "Grid"
-
-[node name="ColorModeBtn" type="Button" parent="HUD/TopBar/Margin/HBox"]
-unique_name_in_owner = true
-layout_mode = 2
-text = "Colors: Multi"
-
-[node name="ClearBtn" type="Button" parent="HUD/TopBar/Margin/HBox"]
-unique_name_in_owner = true
-layout_mode = 2
-text = "Clear"
-
-[node name="PauseBtn" type="Button" parent="HUD/TopBar/Margin/HBox"]
-unique_name_in_owner = true
-layout_mode = 2
+focus_mode = 0
+tooltip_text = "Pause or resume the simulation (Space)"
 text = "Pause"
 
-[node name="RulesBtn" type="Button" parent="HUD/TopBar/Margin/HBox"]
+[node name="SidePanel" type="PanelContainer" parent="HUD/UI"]
 unique_name_in_owner = true
-layout_mode = 2
-text = "Random Rules"
+layout_mode = 1
+anchors_preset = 11
+anchor_left = 1.0
+anchor_right = 1.0
+anchor_bottom = 1.0
+offset_left = -330.0
+offset_top = 44.0
+grow_horizontal = 0
+grow_vertical = 2
 
-[node name="DefaultRulesBtn" type="Button" parent="HUD/TopBar/Margin/HBox"]
+[node name="Scroll" type="ScrollContainer" parent="HUD/UI/SidePanel"]
+layout_mode = 2
+horizontal_scroll_mode = 0
+
+[node name="Margin" type="MarginContainer" parent="HUD/UI/SidePanel/Scroll"]
+layout_mode = 2
+size_flags_horizontal = 3
+theme_override_constants/margin_left = 16
+theme_override_constants/margin_top = 14
+theme_override_constants/margin_right = 16
+theme_override_constants/margin_bottom = 16
+
+[node name="Controls" type="VBoxContainer" parent="HUD/UI/SidePanel/Scroll/Margin"]
 unique_name_in_owner = true
 layout_mode = 2
-text = "Default Rules"
+theme_override_constants/separation = 10
