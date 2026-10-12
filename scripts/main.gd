@@ -22,6 +22,7 @@ const SHORTCUTS := [
 	["N", "New random rules"],
 	["C", "Clear particles"],
 	["G", "Toggle grid"],
+	["W", "Toggle edge wrapping"],
 	["Click", "Add a particle"],
 ]
 
@@ -36,6 +37,7 @@ const SHORTCUTS := [
 
 var _count_slider: HSlider
 var _grid_toggle: CheckButton
+var _wrap_toggle: CheckButton
 ## Sliders bound to SimulationPlane properties, with the values they started at.
 var _property_sliders: Dictionary[StringName, HSlider] = {}
 var _property_defaults: Dictionary[StringName, float] = {}
@@ -85,6 +87,8 @@ func _unhandled_input(event: InputEvent) -> void:
 				simulation_plane.clear_particles()
 			KEY_G:
 				_grid_toggle.button_pressed = not _grid_toggle.button_pressed
+			KEY_W:
+				_wrap_toggle.button_pressed = not _wrap_toggle.button_pressed
 			_:
 				return
 		get_viewport().set_input_as_handled()
@@ -113,6 +117,9 @@ func _build_controls() -> void:
 	])
 	_add_toggle(particles, "Multiple colors", simulation_plane.random_colors,
 		"Give particles different species, each with its own rules", _on_colors_toggled)
+	_wrap_toggle = _add_toggle(particles, "Wrap edges", simulation_plane.wrap_edges,
+		"Toroidal plane: particles leaving one edge re-enter on the opposite side, and forces act across edges (W)",
+		_set_plane_property.bind(&"wrap_edges"))
 
 	var rules: VBoxContainer = _add_section("Rules")
 	var matrix := RuleMatrix.new()
@@ -131,12 +138,16 @@ func _build_controls() -> void:
 		"How far particles sense each other. Smaller is much faster.")
 	_add_property_slider(forces, "Repulsion zone", &"repulsion_zone", 0.05, 0.9, 0.01, "%.2f",
 		"Fraction of the radius where particles always push apart")
+	_add_property_slider(forces, "Cutoff", &"force_cutoff", 0.05, 1.0, 0.01, "%.2f",
+		"Fraction of the radius where color forces end. Lower is faster. Below the repulsion zone, only repulsion is left.")
 	_add_property_slider(forces, "Max speed", &"max_speed", 10.0, 1500.0, 5.0, "%.0f",
 		"Upper bound on particle speed (pixels / second)")
 
 	var friction: VBoxContainer = _add_section("Drag & Friction")
 	_add_property_slider(friction, "Linear drag", &"linear_drag", 0.0, 20.0, 0.1, "%.1f",
 		"Drag proportional to speed, like moving through thick fluid")
+	_add_property_slider(friction, "Relative damping", &"relative_damping", 0.0, 5.0, 0.01, "%.2f",
+		"Damps velocity relative to nearby particles, so clusters move together instead of jittering")
 	_add_property_slider(friction, "Air drag", &"quadratic_drag", 0.0, 0.02, 0.0001, "%.4f",
 		"Drag proportional to speed squared. Mostly slows fast particles.")
 	_add_property_slider(friction, "Surface friction", &"surface_friction", 0.0, 300.0, 1.0, "%.0f",

@@ -24,6 +24,13 @@ const MAX_STEP := 1.0 / 30.0
 			_fit()
 		queue_redraw()
 
+## Makes the plane a torus: particles leaving one edge re-enter on the opposite side, and
+## forces and collisions act across the edges. When off, particles bounce off the edges.
+@export var wrap_edges: bool = false:
+	set(value):
+		wrap_edges = value
+		queue_redraw()
+
 ## Fill color for the 2D plane surface.
 @export var plane_color: Color = Color(0.08, 0.10, 0.15, 1.0)
 
@@ -82,6 +89,10 @@ const MAX_STEP := 1.0 / 30.0
 ## Fraction of interaction_radius inside which particles always push apart, regardless of color.
 @export_range(0.05, 0.9) var repulsion_zone: float = 0.3
 
+## Fraction of interaction_radius where color forces end. The attraction curve is squeezed to
+## peak and fade out inside it. Below repulsion_zone, only the close-range repulsion is left.
+@export_range(0.05, 1.0) var force_cutoff: float = 1.0
+
 ## Scales all color-based forces (pixels / second²).
 @export var force_strength: float = 400.0
 
@@ -92,6 +103,11 @@ const MAX_STEP := 1.0 / 30.0
 ## Drag proportional to speed (1 / second), like moving through a thick fluid.
 ## Velocity decays by a factor of e every 1 / linear_drag seconds.
 @export_range(0.0, 20.0, 0.01, "or_greater") var linear_drag: float = 2.0
+
+## Drag on velocity relative to nearby particles (1 / second per neighbor), like viscosity.
+## Neighbors within the force reach pull a particle's velocity toward theirs, nearer ones
+## harder, so clusters move together instead of jittering against each other.
+@export_range(0.0, 5.0, 0.01, "or_greater") var relative_damping: float = 0.0
 
 ## Drag proportional to speed squared (1 / pixel), like air resistance. Barely affects
 ## slow particles but strongly reins in fast ones.
@@ -311,8 +327,10 @@ func _step(delta: float) -> void:
 	_gpu.plane_size = plane_size
 	_gpu.interaction_radius = interaction_radius
 	_gpu.repulsion_zone = repulsion_zone
+	_gpu.force_cutoff = force_cutoff
 	_gpu.force_strength = force_strength
 	_gpu.linear_drag = linear_drag
+	_gpu.relative_damping = relative_damping
 	_gpu.quadratic_drag = quadratic_drag
 	_gpu.surface_friction = surface_friction
 	_gpu.contact_friction = contact_friction
@@ -321,6 +339,7 @@ func _step(delta: float) -> void:
 	_gpu.species_count = _species_total()
 	_gpu.contact_distance = particle_radius * 2.0 if particle_collisions else 0.0
 	_gpu.collision_iterations = collision_iterations
+	_gpu.wrap_edges = wrap_edges
 	_gpu.step(delta)
 
 
@@ -387,6 +406,9 @@ func _draw() -> void:
 			draw_line(Vector2(0, y), Vector2(plane_size.x, y), grid_color, -1.0)
 			y += step
 
-	# 3. Plane Border Outline, kept at least one screen pixel wide.
-	# Particles are drawn on top by the MultiMeshInstance2D child.
-	draw_rect(plane_rect, border_color, false, maxf(border_width, 1.0 / scale.x))
+	# 3. Plane Border Outline, kept at least one screen pixel wide, and faded when the edges
+	# wrap since it's no longer a wall. Particles are drawn on top by the MultiMeshInstance2D child.
+	var outline: Color = border_color
+	if wrap_edges:
+		outline.a *= 0.3
+	draw_rect(plane_rect, outline, false, maxf(border_width, 1.0 / scale.x))

@@ -19,6 +19,13 @@ VERSION_DEFINES
 #define SCAN_ITEMS_PER_THREAD (SCAN_BLOCK / WORKGROUP_SIZE)
 // Must match ParticleCompute.MAX_SPECIES.
 #define MAX_SPECIES 16
+// Largest params.cell_reach. Must match ParticleCompute.MAX_CELL_REACH.
+#define MAX_CELL_REACH 2
+// Each row of the neighborhood is one span of cells, or two where it wraps around.
+#define MAX_RANGES (2 * (2 * MAX_CELL_REACH + 1))
+// Bits of params.flags. Must match ParticleCompute.FLAG_*.
+#define FLAG_WRITE_INSTANCES 1u
+#define FLAG_WRAP 2u
 
 layout(local_size_x = WORKGROUP_SIZE, local_size_y = 1, local_size_z = 1) in;
 
@@ -28,7 +35,7 @@ layout(push_constant, std430) uniform Params {
 	uint grid_cols;
 	uint grid_rows;
 	uint species_count;
-	float cell_size;
+	uint flags;
 	float interaction_radius;
 	float repulsion_zone;
 	float force_strength;
@@ -41,13 +48,25 @@ layout(push_constant, std430) uniform Params {
 	float quadratic_drag;
 	float surface_friction;
 	float contact_friction;
-	uint write_instances;
 	uint seed;
+	// Fraction of interaction_radius where color forces end, never below repulsion_zone.
+	float force_cutoff;
+	// Cells the neighbor search reaches out on each side of a particle's cell.
+	uint cell_reach;
+	float relative_damping;
+	uint padding1;
+	uint padding2;
 } params;
 
+bool wrapping() {
+	return (params.flags & FLAG_WRAP) != 0u;
+}
+
+// The grid's cells exactly tile the plane, so cells along a wrapped edge line up.
 ivec2 cell_coord(vec2 pos) {
-	ivec2 cell = ivec2(floor(pos / params.cell_size));
-	return clamp(cell, ivec2(0), ivec2(int(params.grid_cols) - 1, int(params.grid_rows) - 1));
+	vec2 grid = vec2(params.grid_cols, params.grid_rows);
+	ivec2 cell = ivec2(floor(pos / params.plane_size * grid));
+	return clamp(cell, ivec2(0), ivec2(grid) - 1);
 }
 
 uint cell_index(int x, int y) {
@@ -58,8 +77,13 @@ uint cell_index(int x, int y) {
 // block and block_offset holds where each block starts. c may be one past the last cell.
 #define CELL_BEGIN(c) (cell_start[c] + block_offset[(c) / SCAN_BLOCK])
 
-// Keeps a particle inside the plane, bouncing its velocity off the edges.
+// Keeps a particle on the plane: carries it to the opposite edge when wrapping,
+// otherwise bounces its velocity off the edges.
 void confine(inout vec2 pos, inout vec2 vel) {
+	if (wrapping()) {
+		pos = mod(pos, params.plane_size);
+		return;
+	}
 	vec2 lo = vec2(params.edge_margin);
 	vec2 hi = max(lo, params.plane_size - vec2(params.edge_margin));
 	if (pos.x < lo.x) {
@@ -269,12 +293,67 @@ layout(set = 0, binding = 5, std430) restrict readonly buffer Palette { vec4 pal
 layout(set = 0, binding = 6, std430) restrict writeonly buffer Instances { vec4 instances[]; };
 
 void write_instance(uint i, vec2 pos) {
-	if (params.write_instances == 0u) {
+	if ((params.flags & FLAG_WRITE_INSTANCES) == 0u) {
 		return;
 	}
 	instances[i * 3u] = vec4(1.0, 0.0, 0.0, pos.x);
 	instances[i * 3u + 1u] = vec4(0.0, 1.0, 0.0, pos.y);
 	instances[i * 3u + 2u] = palette[species[i]];
+}
+
+// When wrapping, the offset to the nearest copy of the other particle across the edges.
+vec2 wrap_offset(vec2 offset) {
+	if (wrapping()) {
+		offset -= params.plane_size * round(offset / params.plane_size);
+	}
+	return offset;
+}
+
+// Fills ranges with the [begin, end) sorted-index spans holding the particles of the cells
+// within params.cell_reach of cell, and returns how many there are. Neighboring cells in one
+// row are consecutive, so each row is one span, or two where it wraps around the plane's edge.
+// Grids too small to fit the whole neighborhood visit each row or column only once.
+int neighbor_ranges(ivec2 cell, out uvec2 ranges[MAX_RANGES]) {
+	int cols = int(params.grid_cols);
+	int rows = int(params.grid_rows);
+	int reach = int(params.cell_reach);
+	int width = 2 * reach + 1;
+	ivec2 lo = cell - reach;
+	ivec2 hi = cell + reach;
+	if (!wrapping() || cols < width) {
+		lo.x = max(lo.x, 0);
+		hi.x = min(hi.x, cols - 1);
+	}
+	if (!wrapping() || rows < width) {
+		lo.y = max(lo.y, 0);
+		hi.y = min(hi.y, rows - 1);
+	}
+
+	ivec2 spans[2];
+	int span_count = 1;
+	if (lo.x < 0) {
+		spans[0] = ivec2(0, hi.x);
+		spans[1] = ivec2(lo.x + cols, cols - 1);
+		span_count = 2;
+	} else if (hi.x >= cols) {
+		spans[0] = ivec2(lo.x, cols - 1);
+		spans[1] = ivec2(0, hi.x - cols);
+		span_count = 2;
+	} else {
+		spans[0] = ivec2(lo.x, hi.x);
+	}
+
+	int count = 0;
+	for (int y = lo.y; y <= hi.y; y++) {
+		int row = (y + rows) % rows;
+		for (int s = 0; s < span_count; s++) {
+			uint first = cell_index(spans[s].x, row);
+			uint last = cell_index(spans[s].y, row);
+			ranges[count] = uvec2(CELL_BEGIN(first), CELL_BEGIN(last + 1u));
+			count++;
+		}
+	}
+	return count;
 }
 
 #endif
@@ -303,41 +382,57 @@ void main() {
 	uint rule_row = species[i] * params.species_count;
 
 	float r_max = params.interaction_radius;
-	float r_max_sq = r_max * r_max;
 	float inv_r_max = 1.0 / r_max;
 	float beta = params.repulsion_zone;
+	float cutoff = params.force_cutoff;
+	float reach = r_max * cutoff;
+	float reach_sq = reach * reach;
 	float inv_beta = 1.0 / beta;
-	float inv_falloff = 1.0 / (1.0 - beta);
-	ivec2 cell = cell_coord(pos);
-	int min_col = max(cell.x - 1, 0);
-	int max_col = min(cell.x + 1, int(params.grid_cols) - 1);
+	float inv_falloff = 1.0 / max(cutoff - beta, 1e-6);
+	float inv_reach = 1.0 / reach;
 	vec2 acc = vec2(0.0);
+	vec2 neighbor_vel = vec2(0.0);
+	float neighbor_weight = 0.0;
 
-	// Neighboring cells in one grid row are consecutive, so their particles form one range.
-	for (int ny = max(cell.y - 1, 0); ny <= min(cell.y + 1, int(params.grid_rows) - 1); ny++) {
-		uint begin = CELL_BEGIN(cell_index(min_col, ny));
-		uint end = CELL_BEGIN(cell_index(max_col, ny) + 1u);
-		for (uint j = begin; j < end; j++) {
-			vec2 offset = state_in[j].xy - pos;
+	uvec2 ranges[MAX_RANGES];
+	int range_count = neighbor_ranges(cell_coord(pos), ranges);
+	for (int n = 0; n < range_count; n++) {
+		for (uint j = ranges[n].x; j < ranges[n].y; j++) {
+			vec4 other = state_in[j];
+			vec2 offset = wrap_offset(other.xy - pos);
 			float dist_sq = dot(offset, offset);
 			// Also skips the particle itself, which sits at distance 0.
-			if (dist_sq >= r_max_sq || dist_sq < 1e-8) {
+			if (dist_sq >= reach_sq || dist_sq < 1e-8) {
 				continue;
 			}
 			float inv_dist = inversesqrt(dist_sq);
-			float r = dist_sq * inv_dist * inv_r_max;
-			// Close range always repels; beyond it the color rule peaks mid-range and fades out.
+			float dist = dist_sq * inv_dist;
+			float r = dist * inv_r_max;
+
+			// Nearer neighbors drag harder on the particle's velocity.
+			float weight = 1.0 - dist * inv_reach;
+			neighbor_vel += other.zw * weight;
+			neighbor_weight += weight;
+
+			// Close range always repels; beyond it the color rule peaks midway to the cutoff
+			// and fades out by it.
 			float f;
 			if (r < beta) {
 				f = r * inv_beta - 1.0;
 			} else {
 				float attraction = rule_table[rule_row + species[j]];
-				f = attraction * (1.0 - abs(2.0 * r - 1.0 - beta) * inv_falloff);
+				f = attraction * max(1.0 - abs(2.0 * r - cutoff - beta) * inv_falloff, 0.0);
 			}
 			acc += offset * (f * inv_dist);
 		}
 	}
 
+	if (neighbor_weight > 0.0) {
+		// Exact solution of dv/dt = k * sum(weight * (v_j - v)) with the neighbors' velocities
+		// held fixed, so strong damping only brings the particle to their weighted mean velocity.
+		vec2 mean_vel = neighbor_vel / neighbor_weight;
+		vel = mix(vel, mean_vel, 1.0 - exp(-params.relative_damping * neighbor_weight * params.delta));
+	}
 	vel += acc * params.force_strength * params.delta;
 	vel *= params.damping;
 	float speed = length(vel);
@@ -384,21 +479,18 @@ void main() {
 	vec2 vel = state.zw;
 	float contact = params.contact_distance;
 	float contact_sq = contact * contact;
-	ivec2 cell = cell_coord(pos);
-	int min_col = max(cell.x - 1, 0);
-	int max_col = min(cell.x + 1, int(params.grid_cols) - 1);
 	vec2 push = vec2(0.0);
 	vec2 vel_fix = vec2(0.0);
 
-	for (int ny = max(cell.y - 1, 0); ny <= min(cell.y + 1, int(params.grid_rows) - 1); ny++) {
-		uint begin = CELL_BEGIN(cell_index(min_col, ny));
-		uint end = CELL_BEGIN(cell_index(max_col, ny) + 1u);
-		for (uint j = begin; j < end; j++) {
+	uvec2 ranges[MAX_RANGES];
+	int range_count = neighbor_ranges(cell_coord(pos), ranges);
+	for (int n = 0; n < range_count; n++) {
+		for (uint j = ranges[n].x; j < ranges[n].y; j++) {
 			if (j == i) {
 				continue;
 			}
 			vec4 other = state_in[j];
-			vec2 offset = other.xy - pos;
+			vec2 offset = wrap_offset(other.xy - pos);
 			float dist_sq = dot(offset, offset);
 			if (dist_sq >= contact_sq) {
 				continue;

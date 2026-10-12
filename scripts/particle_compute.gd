@@ -10,11 +10,14 @@ extends RefCounted
 ##   scan_blocks - prefix-sum the counts within blocks of cells
 ##   scan_totals - prefix-sum the block totals into each block's offset
 ##   reorder     - copy the particles into cell order, so neighbors are contiguous in memory
-## Each step builds a grid with cell size = interaction radius and runs:
-##   forces  - sum color forces from the 3x3 neighboring cells, apply drag and surface
-##             friction, and integrate
-## then, collision_iterations times, rebuilds a grid with cell size = contact distance and runs:
+## Each step builds a grid with cells 1 / MAX_CELL_REACH of the force reach (interaction
+## radius x cutoff) across and runs:
+##   forces  - sum color forces from the neighboring cells within the reach, damp velocity
+##             relative to those neighbors, apply drag and surface friction, and integrate
+## then builds a grid with cell size = contact distance and, collision_iterations times, runs:
 ##   collide - push overlapping particles apart and apply contact friction
+## The collision grid isn't rebuilt between iterations, so pairs that drift into contact from
+## beyond the neighboring cells during them are only caught on the next step.
 ## The last pass of a step also writes the MultiMesh.
 
 const SHADER_FILE: RDShaderFile = preload("res://shaders/particle_sim.glsl")
@@ -25,14 +28,26 @@ const MAX_SPECIES := 16
 const WORKGROUP_SIZE := 256
 ## Grid cells prefix-summed per scan_blocks workgroup. Must match SCAN_BLOCK in particle_sim.glsl.
 const SCAN_BLOCK := 1024
+## Most cells the neighbor search reaches out on each side, which is also how many cells
+## the force reach is split into. Must match MAX_CELL_REACH in particle_sim.glsl.
+const MAX_CELL_REACH := 2
 ## Byte size of the Params push constant block in particle_sim.glsl.
-const PUSH_CONSTANT_SIZE := 80
+const PUSH_CONSTANT_SIZE := 96
+## Bits of the flags push constant. Must match FLAG_* in particle_sim.glsl.
+const FLAG_WRITE_INSTANCES := 1
+const FLAG_WRAP := 2
 
 var plane_size: Vector2 = Vector2.ONE
 var interaction_radius: float = 80.0
 var repulsion_zone: float = 0.3
+## Fraction of interaction_radius where color forces end. Values below repulsion_zone leave
+## only the close-range repulsion.
+var force_cutoff: float = 1.0
 var force_strength: float = 400.0
 var linear_drag: float = 3.0
+## How fast a particle's velocity relaxes toward its neighbors' (1 / second per neighbor,
+## weighted by closeness).
+var relative_damping: float = 0.0
 var quadratic_drag: float = 0.0
 var surface_friction: float = 0.0
 var contact_friction: float = 0.0
@@ -42,6 +57,9 @@ var species_count: int = 1
 ## Closest two particle centers may get (one particle diameter). 0 disables collisions.
 var contact_distance: float = 0.0
 var collision_iterations: int = 4
+## Toroidal plane: particles leaving one edge re-enter on the opposite one, and forces and
+## collisions act across the edges.
+var wrap_edges: bool = false
 
 var particle_count: int = 0
 
@@ -117,10 +135,10 @@ func spawn(count: int, species_choices: int, margin: float, rng_seed: int, insta
 	_allocate(count, PackedByteArray(), PackedByteArray(), instance_buffer)
 	if count == 0:
 		return
-	var push: PackedByteArray = _push_constant(0.0, Vector2i.ONE, 1.0, false)
+	var push: PackedByteArray = _push_constant(0.0, Vector2i.ONE, 1, false)
 	push.encode_u32(12, species_choices)
 	push.encode_float(44, margin)
-	push.encode_u32(76, rng_seed)
+	push.encode_u32(72, rng_seed)
 	var spawn_set: RID = _make_set(&"spawn", [_state_buffers[0], _species_buffers[0]])
 	var list: int = _begin_list()
 	_dispatch(list, &"spawn", spawn_set, push, _particle_groups())
@@ -149,7 +167,8 @@ func step(delta: float) -> void:
 		return
 
 	var collisions: bool = contact_distance > 0.0
-	var force_cell: float = maxf(maxf(interaction_radius, contact_distance), 1.0)
+	var reach: float = interaction_radius * _cutoff()
+	var force_cell: float = maxf(maxf(reach / MAX_CELL_REACH, contact_distance), 1.0)
 	var force_grid: Vector2i = _grid_for(force_cell)
 	var collide_grid: Vector2i = _grid_for(contact_distance) if collisions else Vector2i.ONE
 	_ensure_cell_capacity(maxi(force_grid.x * force_grid.y, collide_grid.x * collide_grid.y))
@@ -158,19 +177,24 @@ func step(delta: float) -> void:
 	var groups: int = _particle_groups()
 	var list: int = _begin_list()
 
-	var force_push: PackedByteArray = _push_constant(delta, force_grid, force_cell, iterations == 0)
+	var force_push: PackedByteArray = _push_constant(delta, force_grid, _cells_spanned(reach, force_grid), iterations == 0)
 	_build_grid(list, force_push, force_grid, groups)
 	_dispatch(list, &"forces", _uniform_sets["forces%d" % _species_index], force_push, groups)
 
 	if iterations > 0:
-		var collide_push: PackedByteArray = _push_constant(delta, collide_grid, contact_distance, false)
+		var collide_push: PackedByteArray = _push_constant(delta, collide_grid, 1, false)
+		_build_grid(list, collide_push, collide_grid, groups)
 		for iteration in range(iterations):
 			if iteration == iterations - 1:
-				collide_push.encode_u32(72, 1)
-			_build_grid(list, collide_push, collide_grid, groups)
-			_dispatch(list, &"collide", _uniform_sets["collide%d" % _species_index], collide_push, groups)
+				collide_push = _push_constant(delta, collide_grid, 1, true)
+			# Iterations ping-pong between the two state buffers, keeping the sorted order.
+			var direction: String = "collide" if iteration % 2 == 0 else "collide_back"
+			_dispatch(list, &"collide", _uniform_sets["%s%d" % [direction, _species_index]], collide_push, groups)
 
 	_rd.compute_list_end()
+	# After an even number of iterations the particles end up in the sorted buffer.
+	if iterations > 0 and iterations % 2 == 0:
+		_rd.buffer_copy(_state_buffers[1], _state_buffers[0], 0, 0, particle_count * 16)
 
 
 func free_resources() -> void:
@@ -233,11 +257,26 @@ func _build_grid(list: int, push: PackedByteArray, grid: Vector2i, groups: int) 
 	_species_index = 1 - _species_index
 
 
-func _grid_for(cell_size: float) -> Vector2i:
-	return Vector2i(maxi(1, ceili(plane_size.x / cell_size)), maxi(1, ceili(plane_size.y / cell_size)))
+## Grid whose cells exactly tile the plane and are each at least min_cell_size across, so the
+## 3x3 cells around a particle cover everything within min_cell_size, even across a wrapped edge.
+func _grid_for(min_cell_size: float) -> Vector2i:
+	return Vector2i(maxi(1, floori(plane_size.x / min_cell_size)), maxi(1, floori(plane_size.y / min_cell_size)))
 
 
-func _push_constant(delta: float, grid: Vector2i, cell_size: float, write_instances: bool) -> PackedByteArray:
+## How many cells of grid the neighbor search must reach out on each side to cover distance.
+## The slack keeps rounding from adding a whole ring of cells when distance fits exactly.
+func _cells_spanned(distance: float, grid: Vector2i) -> int:
+	var cell: float = minf(plane_size.x / grid.x, plane_size.y / grid.y)
+	return clampi(ceili(distance / cell - 1e-6), 1, MAX_CELL_REACH)
+
+
+func _push_constant(delta: float, grid: Vector2i, cell_reach: int, write_instances: bool) -> PackedByteArray:
+	var flags: int = 0
+	if write_instances:
+		flags |= FLAG_WRITE_INSTANCES
+	if wrap_edges:
+		flags |= FLAG_WRAP
+
 	var push := PackedByteArray()
 	push.resize(PUSH_CONSTANT_SIZE)
 	push.fill(0)
@@ -245,7 +284,7 @@ func _push_constant(delta: float, grid: Vector2i, cell_size: float, write_instan
 	push.encode_u32(4, grid.x)
 	push.encode_u32(8, grid.y)
 	push.encode_u32(12, species_count)
-	push.encode_float(16, cell_size)
+	push.encode_u32(16, flags)
 	push.encode_float(20, interaction_radius)
 	push.encode_float(24, repulsion_zone)
 	push.encode_float(28, force_strength)
@@ -259,8 +298,14 @@ func _push_constant(delta: float, grid: Vector2i, cell_size: float, write_instan
 	push.encode_float(60, quadratic_drag)
 	push.encode_float(64, surface_friction)
 	push.encode_float(68, contact_friction)
-	push.encode_u32(72, 1 if write_instances else 0)
+	push.encode_float(76, _cutoff())
+	push.encode_u32(80, cell_reach)
+	push.encode_float(84, relative_damping)
 	return push
+
+
+func _cutoff() -> float:
+	return clampf(force_cutoff, repulsion_zone, 1.0)
 
 
 ## Grows the per-cell buffers when a grid needs more cells, then rebuilds uniform sets.
@@ -297,7 +342,11 @@ func _build_uniform_sets() -> void:
 		]
 		var force_buffers: Array[RID] = collide_buffers.duplicate()
 		force_buffers.append(_rules_buffer)
+		var collide_back_buffers: Array[RID] = collide_buffers.duplicate()
+		collide_back_buffers[0] = home
+		collide_back_buffers[1] = sorted
 		_uniform_sets["collide%d" % src] = _make_set(&"collide", collide_buffers)
+		_uniform_sets["collide_back%d" % src] = _make_set(&"collide", collide_back_buffers)
 		_uniform_sets["forces%d" % src] = _make_set(&"forces", force_buffers)
 
 
